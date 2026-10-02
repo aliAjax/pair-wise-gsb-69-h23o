@@ -2,6 +2,13 @@ import { HttpClient } from '@angular/common/http';
 import { inject, Injectable } from '@angular/core';
 import { catchError, Observable, of, tap } from 'rxjs';
 import { ChangeRequest } from '../models/change-request.model';
+import {
+  ChangeLedger,
+  EVENT_STATUS_LABELS,
+  SITE_LABELS,
+  describeEvent,
+  projectLedger,
+} from '../models/execution-ledger.model';
 
 const STORAGE_KEY = 'pair-wise-gsb-69-changes';
 
@@ -32,7 +39,7 @@ export class ChangeRequestService {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(changes));
   }
 
-  exportRetrospective(change: ChangeRequest): string {
+  exportRetrospective(change: ChangeRequest, ledger?: ChangeLedger): string {
     const lines = [
       `# ${change.id} ${change.title} 复盘记录`,
       '',
@@ -44,8 +51,7 @@ export class ChangeRequestService {
       '## 执行偏离',
       ...(change.deviations.length
         ? change.deviations.map(
-            (item) =>
-              `- ${item.recordedAt} ${item.owner} [${item.decision}] ${item.description}`,
+            (item) => `- ${item.recordedAt} ${item.owner} [${item.decision}] ${item.description}`,
           )
         : ['- 无']),
       '',
@@ -54,6 +60,35 @@ export class ChangeRequestService {
         (item) => `- ${item.timestamp} ${item.actor} ${item.action}：${item.detail}`,
       ),
     ];
+
+    if (ledger) {
+      const projection = projectLedger(ledger);
+      lines.push(
+        '',
+        `## 双端事件账本（v${ledger.version} / 纪元 ${ledger.epoch}）`,
+        '',
+        `最终结论：${projection.outcome ?? (projection.conclusionBlocked ? '冲突待复核，未成立' : '执行中')}`,
+        '',
+        ...ledger.events.map(
+          (event) =>
+            `- v${event.version} 步骤${event.stepNo ?? '-'} ${event.occurredAt} ` +
+            `[${SITE_LABELS[event.site]}] ${describeEvent(event)}（${EVENT_STATUS_LABELS[event.status]}）`,
+        ),
+      );
+      if (ledger.conflicts.length) {
+        lines.push(
+          '',
+          '### 冲突复核',
+          ...ledger.conflicts.map(
+            (conflict) =>
+              `- ${conflict.reconciliationKey} ${conflict.status}` +
+              (conflict.reviewedBy ? `，复核人：${conflict.reviewedBy}` : '') +
+              (conflict.acceptedEventId ? `，采纳：${conflict.acceptedEventId}` : ''),
+          ),
+        );
+      }
+    }
+
     return lines.join('\n');
   }
 }

@@ -1,17 +1,12 @@
 import { DatePipe, NgClass } from '@angular/common';
-import {
-  ChangeDetectionStrategy,
-  Component,
-  computed,
-  inject,
-  signal,
-} from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 import { ClarityModule } from '@clr/angular';
 import { Store } from '@ngrx/store';
 import { AuditTrailComponent } from '../../components/audit-trail/audit-trail.component';
 import { DependencyGraphComponent } from '../../components/dependency-graph/dependency-graph.component';
+import { ExecutionLedgerPanelComponent } from '../../components/execution-ledger-panel/execution-ledger-panel.component';
 import { ValidationPanelComponent } from '../../components/validation-panel/validation-panel.component';
 import { WindowGanttComponent } from '../../components/window-gantt/window-gantt.component';
 import {
@@ -26,9 +21,22 @@ import {
   STATUS_LABELS,
   validateChange,
 } from '../../models/change-request.model';
+import {
+  ExecutionEvent,
+  LedgerSiteId,
+  SITE_LABELS,
+  newEventId,
+  orderedSteps,
+  projectLedger,
+} from '../../models/execution-ledger.model';
 import { ChangeRequestService } from '../../services/change-request.service';
 import { ChangeRequestActions } from '../../store/change-request.actions';
-import { selectAllChanges } from '../../store/change-request.selectors';
+import {
+  selectAllChanges,
+  selectCurrentSite,
+  selectLedgerByChangeId,
+  selectLedgerWorkspace,
+} from '../../store/change-request.selectors';
 
 type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval' | 'audit';
 
@@ -43,6 +51,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
     ClarityModule,
     AuditTrailComponent,
     DependencyGraphComponent,
+    ExecutionLedgerPanelComponent,
     ValidationPanelComponent,
     WindowGanttComponent,
   ],
@@ -104,9 +113,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   class="btn btn-sm"
                   type="button"
                   (click)="editing() ? cancelEdit() : beginEdit()"
-                  [disabled]="item.status === 'executing' || item.status === 'completed'"
+                  [disabled]="item.status === 'completed'"
                 >
-                  {{ editing() ? '取消编辑' : '编辑方案' }}
+                  {{ editing() ? '取消编辑' : '编辑窗口/资源' }}
                 </button>
               </div>
 
@@ -159,7 +168,14 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                     </clr-input-container>
                   </div>
                   <div class="edit-actions">
-                    <button class="btn btn-primary" type="button" (click)="saveEdit()">保存方案</button>
+                    @if (item.status === 'executing') {
+                      <span class="edit-hint">
+                        保存窗口/资源变化后，未确认事件将先失效并需重新确认；已成立的操作仍可从账本还原。
+                      </span>
+                    }
+                    <button class="btn btn-primary" type="button" (click)="saveEdit()">
+                      保存方案
+                    </button>
                   </div>
                 </div>
               } @else {
@@ -181,7 +197,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   </div>
                   <div>
                     <dt>当前门禁</dt>
-                    <dd>{{ pendingStage() ? stageLabel(pendingStage()!) + '待会签' : approvalGate() }}</dd>
+                    <dd>
+                      {{ pendingStage() ? stageLabel(pendingStage()!) + '待会签' : approvalGate() }}
+                    </dd>
                   </div>
                 </dl>
               }
@@ -258,7 +276,12 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <div class="surface-heading">
                 <div>
                   <h2>执行步骤</h2>
-                  <span>执行中可逐项勾选，所有操作保留时间戳</span>
+                  <span>
+                    勾选先作为未确认事件进入发件箱，合并确认后才计入完成
+                    @if (ledgerVersion(); as v) {
+                      （当前 v{{ v }}）
+                    }
+                  </span>
                 </div>
                 @if (item.status === 'approved') {
                   <button class="btn btn-primary" type="button" (click)="startExecution()">
@@ -267,20 +290,20 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                 }
               </div>
               <div class="step-list">
-                @for (step of stepsBy(item); track step.id) {
-                  <label class="step-row" [class.completed]="step.completed">
+                @for (step of stepsBy(item); track step.id; let i = $index) {
+                  <label class="step-row" [class.completed]="stepChecked(step)">
                     <input
                       type="checkbox"
-                      [checked]="step.completed"
+                      [checked]="stepChecked(step)"
                       [disabled]="item.status !== 'executing'"
-                      (change)="toggleStep(step.id)"
+                      (change)="toggleStep(step, i + 1)"
                     />
                     <span class="phase">{{ phaseLabel(step.phase) }}</span>
                     <div>
-                      <strong>{{ step.title }}</strong>
+                      <strong>{{ i + 1 }}. {{ step.title }}</strong>
                       <code>{{ step.command || '未填写命令' }}</code>
                     </div>
-                    <span>{{ step.owner || '未指定' }}</span>
+                    <span>{{ stepOwner(step) }}</span>
                   </label>
                 } @empty {
                   <p class="empty">没有执行步骤。</p>
@@ -294,9 +317,15 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <h2>实时执行记录</h2>
                   <span>记录偏离并明确继续、暂停或回滚</span>
                 </div>
-                <a class="btn btn-sm" href="https://logs.example.internal/change/{{ item.id }}" target="_blank" rel="noopener">
+                <a
+                  class="btn btn-sm"
+                  href="https://logs.example.internal/change/{{ item.id }}"
+                  target="_blank"
+                  rel="noopener"
+                >
                   打开实时日志
                 </a>
+                <span class="site-pill">本端：{{ siteLabel(currentSite()) }}</span>
               </div>
               @if (item.status === 'executing') {
                 <div class="deviation-form">
@@ -327,14 +356,29 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   </div>
                 </div>
                 <div class="completion-actions">
-                  <button class="btn" type="button" (click)="complete('rolled_back')">判定回滚</button>
-                  <button class="btn btn-primary" type="button" (click)="complete('completed')">
+                  @if (projection()?.conclusionBlocked) {
+                    <span class="completion-hint">存在冲突待复核，结论暂不能成立</span>
+                  }
+                  <button
+                    class="btn"
+                    type="button"
+                    (click)="complete('rolled_back')"
+                    [disabled]="conclusionBlocked()"
+                  >
+                    判定回滚
+                  </button>
+                  <button
+                    class="btn btn-primary"
+                    type="button"
+                    (click)="complete('completed')"
+                    [disabled]="conclusionBlocked()"
+                  >
                     执行完成
                   </button>
                 </div>
               }
               <div class="deviation-list">
-                @for (deviation of item.deviations; track deviation.id) {
+                @for (deviation of deviationsView(); track deviation.id) {
                   <article>
                     <div>
                       <strong>{{ deviation.owner }}</strong>
@@ -344,10 +388,18 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                     <span>{{ decisionLabel(deviation.decision) }}</span>
                   </article>
                 } @empty {
-                  <p class="empty">尚无执行偏离。</p>
+                  <p class="empty">尚无已确认的执行偏离。</p>
                 }
               </div>
             </section>
+
+            @if (
+              item.status === 'executing' ||
+              item.status === 'completed' ||
+              item.status === 'rolled_back'
+            ) {
+              <app-execution-ledger-panel [change]="item" />
+            }
           </div>
         }
 
@@ -428,9 +480,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <p class="empty">当前状态不允许审批操作。</p>
                 }
               } @else {
-                <p class="approved-message">
-                  会签已完成。开始执行后审批记录自动冻结，不允许修改。
-                </p>
+                <p class="approved-message">会签已完成。开始执行后审批记录自动冻结，不允许修改。</p>
               }
             </section>
 
@@ -722,9 +772,29 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
       .completion-actions,
       .approval-actions {
         display: flex;
+        align-items: center;
         justify-content: flex-end;
         gap: 10px;
         margin-top: 16px;
+      }
+
+      .edit-hint {
+        margin-right: auto;
+        color: #7a5200;
+        font-size: 12px;
+      }
+
+      .completion-hint {
+        margin-right: auto;
+        color: #8e260f;
+        font-size: 12px;
+      }
+
+      .site-pill {
+        padding: 3px 9px;
+        background: #edf3f6;
+        color: #205d7e;
+        font-size: 11px;
       }
 
       .resource-table article {
@@ -979,6 +1049,13 @@ export class ChangeDetailComponent {
   private readonly changeId = this.route.snapshot.paramMap.get('id') ?? '';
 
   readonly changes = this.store.selectSignal(selectAllChanges);
+  private readonly workspace = this.store.selectSignal(selectLedgerWorkspace);
+  readonly currentSite = this.store.selectSignal(selectCurrentSite);
+  readonly ledger = this.store.selectSignal(selectLedgerByChangeId(this.changeId));
+  readonly projection = computed(() => {
+    const ledger = this.ledger();
+    return ledger ? projectLedger(ledger) : null;
+  });
   readonly change = computed(() => this.changes().find((item) => item.id === this.changeId));
   readonly selectedTab = signal<DetailTab>('overview');
   readonly editing = signal(false);
@@ -987,6 +1064,13 @@ export class ChangeDetailComponent {
   readonly approvalComment = signal('');
   readonly deviationText = signal('');
   readonly deviationDecision = signal<DeviationRecord['decision']>('continue');
+
+  readonly ledgerVersion = computed(() => this.ledger()?.version);
+  readonly conclusionBlocked = computed(() => Boolean(this.projection()?.conclusionBlocked));
+  readonly deviationsView = computed(() => {
+    const fromLedger = this.projection()?.deviations;
+    return fromLedger && fromLedger.length > 0 ? fromLedger : (this.change()?.deviations ?? []);
+  });
 
   readonly tabs: Array<{ id: DetailTab; label: string }> = [
     { id: 'overview', label: '方案概览' },
@@ -1055,10 +1139,30 @@ export class ChangeDetailComponent {
 
   saveEdit(): void {
     const draft = this.draft();
-    if (!draft) {
+    const original = this.change();
+    if (!draft || !original) {
       return;
     }
     this.store.dispatch(ChangeRequestActions.updateChange({ change: draft }));
+
+    // 执行期调整窗口或资源依赖：未确认事件先失效，再由值守端重新确认。
+    if (original.status === 'executing') {
+      const windowChanged =
+        draft.window.start !== original.window.start ||
+        draft.window.end !== original.window.end ||
+        draft.window.observationWindowMinutes !== original.window.observationWindowMinutes;
+      const resourcesChanged =
+        JSON.stringify(draft.resources.map((resource) => [resource.id, resource.dependencies])) !==
+        JSON.stringify(original.resources.map((resource) => [resource.id, resource.dependencies]));
+      if (windowChanged || resourcesChanged) {
+        this.store.dispatch(
+          ChangeRequestActions.registerContextChange({
+            id: this.changeId,
+            note: windowChanged ? '执行窗口已调整' : '资源或依赖范围已调整',
+          }),
+        );
+      }
+    }
     this.editing.set(false);
     this.draft.set(null);
   }
@@ -1104,8 +1208,51 @@ export class ChangeDetailComponent {
     this.store.dispatch(ChangeRequestActions.startExecution({ id: this.changeId }));
   }
 
-  toggleStep(stepId: string): void {
-    this.store.dispatch(ChangeRequestActions.toggleStep({ id: this.changeId, stepId }));
+  private submitEvent(
+    event: Omit<
+      ExecutionEvent,
+      | 'id'
+      | 'changeId'
+      | 'version'
+      | 'epoch'
+      | 'occurredAt'
+      | 'submittedAt'
+      | 'status'
+      | 'site'
+      | 'actor'
+    >,
+  ): void {
+    const ledger = this.ledger();
+    if (!ledger) {
+      return;
+    }
+    const now = new Date().toISOString();
+    this.store.dispatch(
+      ChangeRequestActions.ledgerEventSubmitted({
+        event: {
+          id: newEventId(event.type),
+          changeId: this.changeId,
+          version: ledger.version,
+          epoch: ledger.epoch,
+          occurredAt: now,
+          submittedAt: now,
+          status: 'pending',
+          site: this.currentSite(),
+          actor: this.actorName(),
+          ...event,
+        },
+      }),
+    );
+  }
+
+  toggleStep(step: ChangeStep, stepNo: number): void {
+    const currentlyDone = this.stepChecked(step);
+    this.submitEvent({
+      type: 'step',
+      stepNo,
+      stepId: step.id,
+      stepDone: !currentlyDone,
+    });
   }
 
   recordDeviation(): void {
@@ -1113,23 +1260,49 @@ export class ChangeDetailComponent {
     if (!description) {
       return;
     }
-    const deviation: DeviationRecord = {
-      id: `dev-${Date.now()}`,
-      recordedAt: new Date().toISOString(),
-      owner: this.change()?.onCall[0] ?? '当前用户',
-      description,
+    this.submitEvent({
+      type: 'deviation',
       decision: this.deviationDecision(),
-    };
-    this.store.dispatch(ChangeRequestActions.recordDeviation({ id: this.changeId, deviation }));
+      deviationText: description,
+    });
     this.deviationText.set('');
   }
 
   complete(result: 'completed' | 'rolled_back'): void {
-    const note =
-      result === 'completed'
-        ? '观察窗口内指标稳定，变更完成。'
-        : '发现不可接受影响，按方案完成回滚。';
-    this.store.dispatch(ChangeRequestActions.completeExecution({ id: this.changeId, result, note }));
+    if (this.conclusionBlocked()) {
+      return;
+    }
+    this.submitEvent({
+      type: 'outcome',
+      outcome: result,
+      note:
+        result === 'completed'
+          ? '观察窗口内指标稳定，变更完成。'
+          : '发现不可接受影响，按方案完成回滚。',
+    });
+  }
+
+  stepChecked(step: ChangeStep): boolean {
+    const projected = this.projection()?.stepState[step.id];
+    return projected ? projected.done : step.completed;
+  }
+
+  stepOwner(step: ChangeStep): string {
+    const projected = this.projection()?.stepState[step.id];
+    if (projected?.done) {
+      return `${this.siteLabel(projected.site)}·${projected.actor}`;
+    }
+    return step.owner || '未指定';
+  }
+
+  actorName(): string {
+    const onCall = this.change()?.onCall ?? [];
+    const site = this.currentSite();
+    return onCall[0] ?? `${this.siteLabel(site)}值守`;
+  }
+
+  siteLabel(site: LedgerSiteId): string {
+    return SITE_LABELS[site];
   }
 
   exportRetrospective(): void {
@@ -1137,7 +1310,7 @@ export class ChangeDetailComponent {
     if (!item) {
       return;
     }
-    const blob = new Blob([this.service.exportRetrospective(item)], {
+    const blob = new Blob([this.service.exportRetrospective(item, this.ledger())], {
       type: 'text/markdown;charset=utf-8',
     });
     const url = URL.createObjectURL(blob);
@@ -1149,11 +1322,7 @@ export class ChangeDetailComponent {
   }
 
   stepsBy(change: ChangeRequest): ChangeStep[] {
-    const order: ChangeStep['phase'][] = ['prepare', 'execute', 'verify', 'rollback'];
-    return [...change.steps].sort((left, right) => {
-      const phase = order.indexOf(left.phase) - order.indexOf(right.phase);
-      return phase || left.id.localeCompare(right.id);
-    });
+    return orderedSteps(change);
   }
 
   completedSteps(change: ChangeRequest): number {
