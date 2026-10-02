@@ -1,11 +1,5 @@
 import { DatePipe, NgClass } from '@angular/common';
-import {
-  ChangeDetectionStrategy,
-  Component,
-  computed,
-  inject,
-  signal,
-} from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 import { ClarityModule } from '@clr/angular';
@@ -26,9 +20,21 @@ import {
   STATUS_LABELS,
   validateChange,
 } from '../../models/change-request.model';
+import {
+  EVENT_CONFIRMATION_LABELS,
+  EXECUTION_EVENT_LABELS,
+  EXECUTION_SOURCE_LABELS,
+  ExecutionEvent,
+  ExecutionSource,
+} from '../../models/execution-ledger';
+import {
+  ProjectedExecution,
+  materializeProjectedChange,
+  projectExecution,
+} from '../../models/execution-projection';
 import { ChangeRequestService } from '../../services/change-request.service';
 import { ChangeRequestActions } from '../../store/change-request.actions';
-import { selectAllChanges } from '../../store/change-request.selectors';
+import { selectAllChanges, selectChangesError } from '../../store/change-request.selectors';
 
 type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval' | 'audit';
 
@@ -56,7 +62,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
               <span class="change-id">{{ item.id }}</span>
               <h1>{{ item.title }}</h1>
             </div>
-            <span class="status" [class]="item.status">{{ statusLabel(item.status) }}</span>
+            <span class="status" [class]="(effectiveChange() ?? item).status">{{
+              statusLabel((effectiveChange() ?? item).status)
+            }}</span>
           </div>
           <p>{{ item.summary || '尚未填写变更摘要。' }}</p>
         </div>
@@ -104,7 +112,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   class="btn btn-sm"
                   type="button"
                   (click)="editing() ? cancelEdit() : beginEdit()"
-                  [disabled]="item.status === 'executing' || item.status === 'completed'"
+                  [disabled]="item.status === 'completed' || item.status === 'rolled_back'"
                 >
                   {{ editing() ? '取消编辑' : '编辑方案' }}
                 </button>
@@ -159,7 +167,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                     </clr-input-container>
                   </div>
                   <div class="edit-actions">
-                    <button class="btn btn-primary" type="button" (click)="saveEdit()">保存方案</button>
+                    <button class="btn btn-primary" type="button" (click)="saveEdit()">
+                      保存方案
+                    </button>
                   </div>
                 </div>
               } @else {
@@ -181,7 +191,9 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   </div>
                   <div>
                     <dt>当前门禁</dt>
-                    <dd>{{ pendingStage() ? stageLabel(pendingStage()!) + '待会签' : approvalGate() }}</dd>
+                    <dd>
+                      {{ pendingStage() ? stageLabel(pendingStage()!) + '待会签' : approvalGate() }}
+                    </dd>
                   </div>
                 </dl>
               }
@@ -253,102 +265,290 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         }
 
         @case ('execution') {
-          <div class="content-grid execution-grid">
-            <section class="surface">
-              <div class="surface-heading">
-                <div>
-                  <h2>执行步骤</h2>
-                  <span>执行中可逐项勾选，所有操作保留时间戳</span>
+          @if (projection(); as projected) {
+            <div class="content-grid execution-grid">
+              <section class="surface">
+                <div class="surface-heading">
+                  <div>
+                    <h2>执行步骤</h2>
+                    <span>
+                      版本 {{ item.executionLedger?.basis.revision ?? 1 }}；按步骤编号与发生时间对账
+                    </span>
+                  </div>
+                  @if (item.status === 'approved') {
+                    <button class="btn btn-primary" type="button" (click)="startExecution()">
+                      开始执行
+                    </button>
+                  }
                 </div>
-                @if (item.status === 'approved') {
-                  <button class="btn btn-primary" type="button" (click)="startExecution()">
-                    开始执行
-                  </button>
-                }
-              </div>
-              <div class="step-list">
-                @for (step of stepsBy(item); track step.id) {
-                  <label class="step-row" [class.completed]="step.completed">
-                    <input
-                      type="checkbox"
-                      [checked]="step.completed"
-                      [disabled]="item.status !== 'executing'"
-                      (change)="toggleStep(step.id)"
-                    />
-                    <span class="phase">{{ phaseLabel(step.phase) }}</span>
-                    <div>
-                      <strong>{{ step.title }}</strong>
-                      <code>{{ step.command || '未填写命令' }}</code>
-                    </div>
-                    <span>{{ step.owner || '未指定' }}</span>
+                <div class="source-strip">
+                  <label>
+                    当前记录端
+                    <select [ngModel]="activeSource()" (ngModelChange)="setSource($event)">
+                      <option value="console">控制台</option>
+                      <option value="datacenter">机房值守</option>
+                    </select>
                   </label>
-                } @empty {
-                  <p class="empty">没有执行步骤。</p>
-                }
-              </div>
-            </section>
-
-            <section class="surface">
-              <div class="surface-heading">
-                <div>
-                  <h2>实时执行记录</h2>
-                  <span>记录偏离并明确继续、暂停或回滚</span>
+                  <span>
+                    待确认 {{ projected.unconfirmedCount }} · 冲突
+                    {{ projected.openConflictCount }} · 失效
+                    {{ projected.invalidatedCount }}
+                  </span>
                 </div>
-                <a class="btn btn-sm" href="https://logs.example.internal/change/{{ item.id }}" target="_blank" rel="noopener">
-                  打开实时日志
-                </a>
-              </div>
-              @if (item.status === 'executing') {
-                <div class="deviation-form">
-                  <clr-textarea-container>
-                    <label>偏离说明</label>
-                    <textarea
-                      clrTextarea
-                      rows="3"
-                      [ngModel]="deviationText()"
-                      (ngModelChange)="deviationText.set($event)"
-                      placeholder="描述实际执行与方案差异"
-                    ></textarea>
-                  </clr-textarea-container>
-                  <div class="deviation-actions">
-                    <clr-select-container>
-                      <label>处置决定</label>
-                      <select
-                        clrSelect
-                        [ngModel]="deviationDecision()"
-                        (ngModelChange)="deviationDecision.set($event)"
-                      >
-                        <option value="continue">继续观察</option>
-                        <option value="pause">暂停执行</option>
-                        <option value="rollback">立即回滚</option>
-                      </select>
-                    </clr-select-container>
-                    <button class="btn" type="button" (click)="recordDeviation()">记录偏离</button>
+                <div class="step-list">
+                  @for (step of projected.steps; track step.id) {
+                    @let pending = pendingStepEvents(step.id);
+                    <label
+                      class="step-row"
+                      [class.completed]="step.completed"
+                      [class.pending]="pending.length"
+                    >
+                      <input
+                        type="checkbox"
+                        [checked]="step.completed"
+                        [indeterminate]="pending.length > 0"
+                        [disabled]="item.status !== 'executing' || pending.length > 0"
+                        (change)="toggleStep(step.id)"
+                      />
+                      <span class="phase">{{ phaseLabel(step.phase) }}</span>
+                      <div>
+                        <strong>{{ step.title }}</strong>
+                        <code>{{ step.command || '未填写命令' }}</code>
+                        @if (pending.length) {
+                          <small class="pending-note">
+                            {{ sourceLabel(pending[0].source) }}
+                            {{ pending[0].type === 'step-completed' ? '完成' : '重开' }}待对账
+                          </small>
+                        }
+                      </div>
+                      <span class="step-side">
+                        {{ step.owner || '未指定' }}
+                        @if (pending.length === 1) {
+                          <div class="step-actions">
+                            <button
+                              class="btn btn-sm btn-outline"
+                              type="button"
+                              (click)="reportCounterpartStep(pending[0], false, $event)"
+                            >
+                              对端同报
+                            </button>
+                            <button
+                              class="btn btn-sm btn-outline"
+                              type="button"
+                              (click)="reportCounterpartStep(pending[0], true, $event)"
+                            >
+                              对端异议
+                            </button>
+                          </div>
+                        }
+                      </span>
+                    </label>
+                  } @empty {
+                    <p class="empty">没有执行步骤。</p>
+                  }
+                </div>
+              </section>
+
+              <section class="surface">
+                <div class="surface-heading">
+                  <div>
+                    <h2>实时执行记录</h2>
+                    <span>两端各持一份；断网恢复后合并，不覆盖原记录</span>
+                  </div>
+                  <a
+                    class="btn btn-sm"
+                    href="https://logs.example.internal/change/{{ item.id }}"
+                    target="_blank"
+                    rel="noopener"
+                  >
+                    实时日志
+                  </a>
+                </div>
+                @if (item.status === 'executing') {
+                  <div class="deviation-form">
+                    <clr-textarea-container>
+                      <label>偏离说明</label>
+                      <textarea
+                        clrTextarea
+                        rows="3"
+                        [ngModel]="deviationText()"
+                        (ngModelChange)="deviationText.set($event)"
+                        placeholder="描述实际执行与方案差异"
+                      ></textarea>
+                    </clr-textarea-container>
+                    <div class="deviation-actions">
+                      <clr-select-container>
+                        <label>处置决定</label>
+                        <select
+                          clrSelect
+                          [ngModel]="deviationDecision()"
+                          (ngModelChange)="deviationDecision.set($event)"
+                        >
+                          <option value="continue">继续观察</option>
+                          <option value="pause">暂停执行</option>
+                          <option value="rollback">立即回滚</option>
+                        </select>
+                      </clr-select-container>
+                      <button class="btn" type="button" (click)="recordDeviation()">
+                        {{ sourceLabel(activeSource()) }}记录偏离
+                      </button>
+                    </div>
+                  </div>
+                  <div class="completion-actions">
+                    <button
+                      class="btn"
+                      type="button"
+                      [disabled]="!canFinish(projected, 'rolled_back')"
+                      (click)="complete('rolled_back')"
+                    >
+                      判定回滚
+                    </button>
+                    <button
+                      class="btn btn-primary"
+                      type="button"
+                      [disabled]="!canFinish(projected, 'completed')"
+                      (click)="complete('completed')"
+                    >
+                      执行完成
+                    </button>
+                  </div>
+                  @if (!canFinish(projected, 'completed')) {
+                    <p class="rule-note">
+                      先完成非回滚步骤，并对所有待确认、冲突或依据失效事件对账/复核。
+                    </p>
+                  }
+                }
+                <div class="deviation-list">
+                  @for (deviation of projected.deviations; track deviation.id) {
+                    <article>
+                      <div>
+                        <strong>{{ deviation.owner }}</strong>
+                        <time>{{ deviation.recordedAt | date: 'MM-dd HH:mm' }}</time>
+                      </div>
+                      <p>{{ deviation.description }}</p>
+                      <span>{{ decisionLabel(deviation.decision) }}</span>
+                    </article>
+                  } @empty {
+                    <p class="empty">尚无执行偏离。</p>
+                  }
+                </div>
+              </section>
+
+              <section class="surface span-2">
+                <div class="surface-heading">
+                  <div>
+                    <h2>事件账本</h2>
+                    <span>
+                      对账键：变更版本 {{ item.executionLedger?.basis.revision ?? 1 }} + 步骤编号 +
+                      发生时间；已冻结审批不参与合并
+                    </span>
+                  </div>
+                  <div class="ledger-toolbar">
+                    <button class="btn btn-sm" type="button" (click)="simulateWriteFailure()">
+                      模拟下次写入失败
+                    </button>
+                    @if (saveError(); as error) {
+                      <button class="btn btn-sm btn-warning" type="button" (click)="retrySave()">
+                        重试写入：{{ error }}
+                      </button>
+                    }
+                    <button class="btn btn-sm btn-primary" type="button" (click)="reconcile()">
+                      断网重连 / 立即对账
+                    </button>
                   </div>
                 </div>
-                <div class="completion-actions">
-                  <button class="btn" type="button" (click)="complete('rolled_back')">判定回滚</button>
-                  <button class="btn btn-primary" type="button" (click)="complete('completed')">
-                    执行完成
-                  </button>
-                </div>
-              }
-              <div class="deviation-list">
-                @for (deviation of item.deviations; track deviation.id) {
-                  <article>
-                    <div>
-                      <strong>{{ deviation.owner }}</strong>
-                      <time>{{ deviation.recordedAt | date: 'MM-dd HH:mm' }}</time>
-                    </div>
-                    <p>{{ deviation.description }}</p>
-                    <span>{{ decisionLabel(deviation.decision) }}</span>
-                  </article>
-                } @empty {
-                  <p class="empty">尚无执行偏离。</p>
+                @if (item.executionLedger; as ledger) {
+                  <div class="ledger-meta">
+                    <span>版本 {{ ledger.basis.revision }}</span>
+                    <span>窗口 {{ ledger.basis.windowHash }}</span>
+                    <span>资源 {{ ledger.basis.resourceHash }}</span>
+                    <span>步骤 {{ ledger.basis.stepHash }}</span>
+                    <span
+                      >上次对账：{{
+                        ledger.lastReconciledAt
+                          ? (ledger.lastReconciledAt | date: 'MM-dd HH:mm:ss')
+                          : '未对账'
+                      }}</span
+                    >
+                  </div>
+                  <div class="ledger-table">
+                    @for (event of ledgerEvents(); track event.id) {
+                      <article [class]="event.status">
+                        <time>{{ event.occurredAt | date: 'MM-dd HH:mm:ss' }}</time>
+                        <span class="source">{{ sourceLabel(event.source) }}</span>
+                        <strong>{{ eventLabel(event.type) }}</strong>
+                        <span
+                          >v{{ event.changeVersion }} /
+                          {{ event.stepNo ? '步骤 ' + event.stepNo : '全局' }}</span
+                        >
+                        <span class="confirm-state">{{ confirmationLabel(event.status) }}</span>
+                        <span class="write-state" [class.failed]="event.writeState === 'failed'">
+                          {{
+                            event.writeState === 'failed'
+                              ? '写入失败'
+                              : event.writeState === 'written'
+                                ? '已写入'
+                                : '待写入'
+                          }}
+                        </span>
+                        <div class="ledger-actions">
+                          @if (
+                            event.status === 'unconfirmed' && event.type === 'deviation-recorded'
+                          ) {
+                            <button
+                              class="btn btn-sm"
+                              type="button"
+                              (click)="counterDeviation(event)"
+                            >
+                              对端同报偏离
+                            </button>
+                          }
+                          @if (event.status === 'unconfirmed' && isTerminal(event.type)) {
+                            <button
+                              class="btn btn-sm"
+                              type="button"
+                              (click)="counterTerminal(event.type)"
+                            >
+                              对端同报结论
+                            </button>
+                            <button
+                              class="btn btn-sm btn-outline"
+                              type="button"
+                              (click)="counterTerminal(event.type, true)"
+                            >
+                              对端相反结论
+                            </button>
+                          }
+                          @if (event.status === 'conflict') {
+                            <button
+                              class="btn btn-sm btn-outline"
+                              type="button"
+                              (click)="resolveConflict(event.id, true)"
+                            >
+                              采纳本端
+                            </button>
+                          }
+                          @if (event.status === 'invalidated') {
+                            <button
+                              class="btn btn-sm btn-outline"
+                              type="button"
+                              (click)="reconfirm(event.id)"
+                            >
+                              重新确认
+                            </button>
+                          }
+                        </div>
+                      </article>
+                    } @empty {
+                      <p class="empty">尚未产生执行事件。</p>
+                    }
+                  </div>
+                } @else {
+                  <p class="empty">审批通过并开始执行后，两端事件会进入同一份账本合并结果。</p>
                 }
-              </div>
-            </section>
-          </div>
+              </section>
+            </div>
+          }
         }
 
         @case ('approval') {
@@ -428,9 +628,7 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
                   <p class="empty">当前状态不允许审批操作。</p>
                 }
               } @else {
-                <p class="approved-message">
-                  会签已完成。开始执行后审批记录自动冻结，不允许修改。
-                </p>
+                <p class="approved-message">会签已完成。开始执行后审批记录自动冻结，不允许修改。</p>
               }
             </section>
 
@@ -454,50 +652,52 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         }
 
         @case ('audit') {
-          <div class="content-grid audit-grid">
-            <section class="surface">
-              <div class="surface-heading">
-                <div>
-                  <h2>审计轨迹</h2>
-                  <span>创建、编辑、会签、执行和回滚均记录</span>
+          @if (effectiveChange(); as effective) {
+            <div class="content-grid audit-grid">
+              <section class="surface">
+                <div class="surface-heading">
+                  <div>
+                    <h2>审计轨迹</h2>
+                    <span>创建、编辑、会签、事件合并、复核、执行和回滚均记录</span>
+                  </div>
+                  <button class="btn btn-sm" type="button" (click)="exportRetrospective()">
+                    导出复盘记录
+                  </button>
                 </div>
-                <button class="btn btn-sm" type="button" (click)="exportRetrospective()">
-                  导出复盘记录
-                </button>
-              </div>
-              <app-audit-trail [records]="item.audit" />
-            </section>
-            <section class="surface">
-              <div class="surface-heading">
-                <div>
-                  <h2>复盘摘要</h2>
-                  <span>进入正式变更档案的事实记录</span>
+                <app-audit-trail [records]="effective.audit" />
+              </section>
+              <section class="surface">
+                <div class="surface-heading">
+                  <div>
+                    <h2>复盘摘要</h2>
+                    <span>完成或回滚均取自同一份合并账本结果</span>
+                  </div>
                 </div>
-              </div>
-              <dl class="facts compact">
-                <div>
-                  <dt>最终状态</dt>
-                  <dd>{{ statusLabel(item.status) }}</dd>
+                <dl class="facts compact">
+                  <div>
+                    <dt>最终状态</dt>
+                    <dd>{{ statusLabel(effective.status) }}</dd>
+                  </div>
+                  <div>
+                    <dt>执行偏离</dt>
+                    <dd>{{ effective.deviations.length }} 条</dd>
+                  </div>
+                  <div>
+                    <dt>审计事件</dt>
+                    <dd>{{ effective.audit.length }} 条</dd>
+                  </div>
+                  <div>
+                    <dt>完成步骤</dt>
+                    <dd>{{ completedSteps(effective) }} / {{ effective.steps.length }}</dd>
+                  </div>
+                </dl>
+                <div class="retrospective-note">
+                  <strong>导出内容</strong>
+                  <p>包含变更窗口、资源范围、确认后的执行偏离、最终状态和完整审计轨迹。</p>
                 </div>
-                <div>
-                  <dt>执行偏离</dt>
-                  <dd>{{ item.deviations.length }} 条</dd>
-                </div>
-                <div>
-                  <dt>审计事件</dt>
-                  <dd>{{ item.audit.length }} 条</dd>
-                </div>
-                <div>
-                  <dt>完成步骤</dt>
-                  <dd>{{ completedSteps(item) }} / {{ item.steps.length }}</dd>
-                </div>
-              </dl>
-              <div class="retrospective-note">
-                <strong>导出内容</strong>
-                <p>包含变更窗口、资源范围、执行偏离、最终状态和完整审计轨迹。</p>
-              </div>
-            </section>
-          </div>
+              </section>
+            </div>
+          }
         }
       }
     } @else {
@@ -793,6 +993,110 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         background: #f5faf6;
       }
 
+      .step-row.pending {
+        background: #fff8e5;
+      }
+
+      .pending-note,
+      .rule-note {
+        color: #8a5a00;
+        font-size: 11px;
+      }
+
+      .step-side {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        align-items: flex-end;
+        font-size: 12px;
+      }
+
+      .step-actions {
+        display: flex;
+        gap: 6px;
+      }
+
+      .source-strip,
+      .ledger-meta {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 0;
+        color: #5f5f5f;
+        font-size: 12px;
+      }
+
+      .source-strip select {
+        margin-left: 8px;
+      }
+
+      .ledger-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 8px;
+      }
+
+      .btn-warning {
+        border-color: #d58d00;
+        background: #fff3d2;
+        color: #7a4d00;
+      }
+
+      .ledger-meta {
+        justify-content: flex-start;
+        border-bottom: 1px solid #e6e6e6;
+      }
+
+      .ledger-table article {
+        display: grid;
+        grid-template-columns: 130px 80px minmax(140px, 1fr) 110px 110px 90px auto;
+        align-items: center;
+        gap: 10px;
+        padding: 11px 4px;
+        border-bottom: 1px solid #e8e8e8;
+        font-size: 12px;
+      }
+
+      .ledger-table article time {
+        color: #666;
+      }
+
+      .ledger-table .source {
+        color: #205d7e;
+      }
+
+      .confirm-state,
+      .write-state {
+        padding: 2px 6px;
+        background: #f1f1f1;
+        text-align: center;
+      }
+
+      .ledger-table article.conflict .confirm-state,
+      .write-state.failed {
+        background: #fbece8;
+        color: #8e260f;
+      }
+
+      .ledger-table article.invalidated .confirm-state {
+        background: #fff3d2;
+        color: #7a4d00;
+      }
+
+      .ledger-table article.confirmed .confirm-state {
+        background: #edf7f0;
+        color: #245f3d;
+      }
+
+      .ledger-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 6px;
+      }
+
       .step-row div {
         display: flex;
         flex-direction: column;
@@ -961,8 +1265,14 @@ type DetailTab = 'overview' | 'dependency' | 'window' | 'execution' | 'approval'
         }
 
         .resource-table article,
-        .step-row {
+        .step-row,
+        .ledger-table article {
           grid-template-columns: 1fr;
+        }
+
+        .ledger-actions,
+        .ledger-toolbar {
+          justify-content: flex-start;
         }
 
         .tab-nav {
@@ -987,6 +1297,8 @@ export class ChangeDetailComponent {
   readonly approvalComment = signal('');
   readonly deviationText = signal('');
   readonly deviationDecision = signal<DeviationRecord['decision']>('continue');
+  readonly activeSource = signal<ExecutionSource>('console');
+  readonly saveError = this.store.selectSignal(selectChangesError);
 
   readonly tabs: Array<{ id: DetailTab; label: string }> = [
     { id: 'overview', label: '方案概览' },
@@ -1005,6 +1317,26 @@ export class ChangeDetailComponent {
   readonly hasBlockers = computed(() =>
     this.issues().some((issue) => issue.severity === 'blocker'),
   );
+
+  readonly projection = computed<ProjectedExecution | null>(() => {
+    const item = this.change();
+    return item ? projectExecution(item, item.executionLedger) : null;
+  });
+
+  readonly effectiveChange = computed<ChangeRequest | null>(() => {
+    const item = this.change();
+    return item ? materializeProjectedChange(item, item.executionLedger) : null;
+  });
+
+  readonly ledgerEvents = computed<ExecutionEvent[]>(() => {
+    const ledger = this.change()?.executionLedger;
+    return ledger
+      ? [...ledger.events].sort(
+          (left, right) =>
+            new Date(right.occurredAt).getTime() - new Date(left.occurredAt).getTime(),
+        )
+      : [];
+  });
 
   readonly pendingStage = computed<ApprovalStage | null>(() => {
     const item = this.change();
@@ -1101,11 +1433,36 @@ export class ChangeDetailComponent {
   }
 
   startExecution(): void {
-    this.store.dispatch(ChangeRequestActions.startExecution({ id: this.changeId }));
+    this.store.dispatch(
+      ChangeRequestActions.startExecution({ id: this.changeId, source: this.activeSource() }),
+    );
   }
 
   toggleStep(stepId: string): void {
-    this.store.dispatch(ChangeRequestActions.toggleStep({ id: this.changeId, stepId }));
+    this.store.dispatch(
+      ChangeRequestActions.toggleStep({
+        id: this.changeId,
+        stepId,
+        source: this.activeSource(),
+      }),
+    );
+  }
+
+  reportCounterpartStep(event: ExecutionEvent, opposite: boolean, clickEvent: Event): void {
+    clickEvent.preventDefault();
+    if (!event.stepId) {
+      return;
+    }
+    this.store.dispatch(
+      ChangeRequestActions.toggleStep({
+        id: this.changeId,
+        stepId: event.stepId,
+        source: this.counterpart(event.source),
+        occurredAt: event.occurredAt,
+        oppositeToEventId: opposite ? event.id : undefined,
+      }),
+    );
+    this.reconcile();
   }
 
   recordDeviation(): void {
@@ -1120,20 +1477,111 @@ export class ChangeDetailComponent {
       description,
       decision: this.deviationDecision(),
     };
-    this.store.dispatch(ChangeRequestActions.recordDeviation({ id: this.changeId, deviation }));
+    this.store.dispatch(
+      ChangeRequestActions.recordDeviation({
+        id: this.changeId,
+        deviation,
+        source: this.activeSource(),
+      }),
+    );
     this.deviationText.set('');
   }
 
+  counterDeviation(event: ExecutionEvent): void {
+    if (!event.deviation) {
+      return;
+    }
+    this.store.dispatch(
+      ChangeRequestActions.recordDeviation({
+        id: this.changeId,
+        deviation: {
+          ...event.deviation,
+          recordedAt: event.occurredAt,
+        },
+        source: this.counterpart(event.source),
+      }),
+    );
+    this.reconcile();
+  }
+
+  reconcile(): void {
+    this.store.dispatch(ChangeRequestActions.reconcileLedger({ id: this.changeId }));
+  }
+
+  resolveConflict(eventId: string, _preferCurrent: boolean): void {
+    this.store.dispatch(
+      ChangeRequestActions.resolveLedgerConflict({
+        id: this.changeId,
+        eventId,
+        note: '值守复核后采纳该端记录，另一事件保留但不再参与投影。',
+      }),
+    );
+  }
+
+  reconfirm(eventId: string): void {
+    this.store.dispatch(ChangeRequestActions.reconfirmLedgerEvent({ id: this.changeId, eventId }));
+  }
+
+  simulateWriteFailure(): void {
+    this.service.failNextSave();
+    this.reconcile();
+  }
+
+  retrySave(): void {
+    this.store.dispatch(ChangeRequestActions.retrySaveChanges());
+  }
+
+  counterTerminal(type: ExecutionEvent['type'], opposite = false): void {
+    if (type !== 'execution-completed' && type !== 'execution-rollback') {
+      return;
+    }
+    const target = this.ledgerEvents().find(
+      (event) => event.type === type && event.status === 'unconfirmed',
+    );
+    if (!target) {
+      return;
+    }
+    const sameResult = type === 'execution-completed' ? 'completed' : 'rolled_back';
+    const result = opposite
+      ? sameResult === 'completed'
+        ? 'rolled_back'
+        : 'completed'
+      : sameResult;
+    this.store.dispatch(
+      ChangeRequestActions.completeExecution({
+        id: this.changeId,
+        result,
+        note: opposite
+          ? '对端给出相反最终结论，进入冲突复核。'
+          : String(target.payload['note'] ?? '对端补报相同最终结论'),
+        source: this.counterpart(target.source),
+        occurredAt: target.occurredAt,
+      }),
+    );
+    this.reconcile();
+  }
+
   complete(result: 'completed' | 'rolled_back'): void {
+    const projected = this.projection();
+    if (!projected || !this.canFinish(projected, result)) {
+      return;
+    }
     const note =
       result === 'completed'
-        ? '观察窗口内指标稳定，变更完成。'
-        : '发现不可接受影响，按方案完成回滚。';
-    this.store.dispatch(ChangeRequestActions.completeExecution({ id: this.changeId, result, note }));
+        ? '观察窗口内指标稳定，两端合并账本判定变更完成。'
+        : '发现不可接受影响，两端合并账本判定按方案完成回滚。';
+    this.store.dispatch(
+      ChangeRequestActions.completeExecution({
+        id: this.changeId,
+        result,
+        note,
+        source: this.activeSource(),
+      }),
+    );
   }
 
   exportRetrospective(): void {
-    const item = this.change();
+    const item = this.effectiveChange();
     if (!item) {
       return;
     }
@@ -1158,6 +1606,56 @@ export class ChangeDetailComponent {
 
   completedSteps(change: ChangeRequest): number {
     return change.steps.filter((step) => step.completed).length;
+  }
+
+  pendingStepEvents(stepId: string): ExecutionEvent[] {
+    return (
+      this.change()?.executionLedger?.events.filter(
+        (event) =>
+          event.stepId === stepId &&
+          ['unconfirmed', 'conflict', 'invalidated'].includes(event.status),
+      ) ?? []
+    );
+  }
+
+  canFinish(projected: ProjectedExecution, result: 'completed' | 'rolled_back'): boolean {
+    const operationalStepsComplete =
+      result === 'rolled_back' ||
+      (projected.steps.length > 0 &&
+        projected.steps
+          .filter((step) => step.phase !== 'rollback')
+          .every((step) => step.completed));
+    return (
+      projected.status === 'executing' &&
+      operationalStepsComplete &&
+      projected.openConflictCount === 0 &&
+      projected.invalidatedCount === 0 &&
+      projected.unconfirmedCount === 0
+    );
+  }
+
+  setSource(source: ExecutionSource | string): void {
+    this.activeSource.set(source === 'datacenter' ? 'datacenter' : 'console');
+  }
+
+  counterpart(source: ExecutionSource): ExecutionSource {
+    return source === 'console' ? 'datacenter' : 'console';
+  }
+
+  isTerminal(type: ExecutionEvent['type']): boolean {
+    return type === 'execution-completed' || type === 'execution-rollback';
+  }
+
+  sourceLabel(source: ExecutionSource): string {
+    return EXECUTION_SOURCE_LABELS[source];
+  }
+
+  eventLabel(type: ExecutionEvent['type']): string {
+    return EXECUTION_EVENT_LABELS[type];
+  }
+
+  confirmationLabel(status: ExecutionEvent['status']): string {
+    return EVENT_CONFIRMATION_LABELS[status];
   }
 
   statusLabel(status: ChangeRequest['status']): string {

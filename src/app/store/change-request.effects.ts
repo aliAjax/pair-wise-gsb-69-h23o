@@ -1,7 +1,7 @@
 import { inject, Injectable } from '@angular/core';
 import { Actions, createEffect, ofType } from '@ngrx/effects';
 import { Store } from '@ngrx/store';
-import { catchError, map, of, switchMap, tap, withLatestFrom } from 'rxjs';
+import { catchError, concatMap, exhaustMap, map, of, switchMap, take } from 'rxjs';
 import { ChangeRequestService } from '../services/change-request.service';
 import { ChangeRequestActions } from './change-request.actions';
 import { selectAllChanges } from './change-request.selectors';
@@ -30,24 +30,57 @@ export class ChangeRequestEffects {
     ),
   );
 
-  persistChanges$ = createEffect(
-    () =>
-      this.actions$.pipe(
-        ofType(
-          ChangeRequestActions.createChange,
-          ChangeRequestActions.updateChange,
-          ChangeRequestActions.deleteDraft,
-          ChangeRequestActions.submitForReview,
-          ChangeRequestActions.approveStage,
-          ChangeRequestActions.rejectStage,
-          ChangeRequestActions.startExecution,
-          ChangeRequestActions.toggleStep,
-          ChangeRequestActions.recordDeviation,
-          ChangeRequestActions.completeExecution,
-        ),
-        withLatestFrom(this.store.select(selectAllChanges)),
-        tap(([, changes]) => this.service.save(changes)),
+  persistChanges$ = createEffect(() =>
+    this.actions$.pipe(
+      ofType(
+        ChangeRequestActions.createChange,
+        ChangeRequestActions.updateChange,
+        ChangeRequestActions.deleteDraft,
+        ChangeRequestActions.submitForReview,
+        ChangeRequestActions.approveStage,
+        ChangeRequestActions.rejectStage,
+        ChangeRequestActions.startExecution,
+        ChangeRequestActions.toggleStep,
+        ChangeRequestActions.recordDeviation,
+        ChangeRequestActions.reconcileLedger,
+        ChangeRequestActions.resolveLedgerConflict,
+        ChangeRequestActions.reconfirmLedgerEvent,
+        ChangeRequestActions.completeExecution,
       ),
-    { dispatch: false },
+      concatMap(() =>
+        this.store.select(selectAllChanges).pipe(
+          take(1),
+          switchMap((changes) => this.service.save(changes)),
+          map(() => ChangeRequestActions.saveChangesSuccess()),
+          catchError((error: unknown) =>
+            of(
+              ChangeRequestActions.saveChangesFailure({
+                error: error instanceof Error ? error.message : '事件账本写入失败',
+              }),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  retrySaveChanges$ = createEffect(() =>
+    this.actions$.pipe(
+      ofType(ChangeRequestActions.retrySaveChanges),
+      exhaustMap(() =>
+        this.store.select(selectAllChanges).pipe(
+          take(1),
+          switchMap((changes) => this.service.save(changes)),
+          map(() => ChangeRequestActions.saveChangesSuccess()),
+          catchError((error: unknown) =>
+            of(
+              ChangeRequestActions.saveChangesFailure({
+                error: error instanceof Error ? error.message : '事件账本重试仍失败',
+              }),
+            ),
+          ),
+        ),
+      ),
+    ),
   );
 }
